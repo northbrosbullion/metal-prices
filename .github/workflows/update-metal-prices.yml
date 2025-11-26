@@ -2,9 +2,8 @@ name: Update metal prices
 
 on:
   schedule:
-    # At 09:00, 12:00, and 16:00 UTC every day
-    - cron: "0 9,12,16 * * *"
-  workflow_dispatch: {}  # allows manual run from the Actions tab
+    - cron: "0 9,12,16 * * *"  # 09:00, 12:00, 16:00 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -22,35 +21,32 @@ jobs:
         with:
           node-version: 20
 
-      - name: Fetch prices from GoldAPI and write metal.json
+      - name: Fetch prices (try GOLDAPI_KEY then GOLDAPI_KEY_2)
         env:
-          GOLDAPI_KEY: ${{ secrets.GOLDAPI_KEY }}
+          KEY1: ${{ secrets.GOLDAPI_KEY }}
+          KEY2: ${{ secrets.GOLDAPI_KEY_2 }}
         run: |
           node << 'EOF'
           const fs = require('fs');
           const https = require('https');
 
-          const apiKey = process.env.GOLDAPI_KEY;
-          const goldUrl = "https://www.goldapi.io/api/XAU/GBP";
-          const silverUrl = "https://www.goldapi.io/api/XAG/GBP";
+          const GOLD_URL = "https://www.goldapi.io/api/XAU/GBP";
+          const SILVER_URL = "https://www.goldapi.io/api/XAG/GBP";
 
-          function getJson(url) {
+          function getJson(url, key) {
             return new Promise((resolve, reject) => {
               const req = https.request(url, {
                 method: 'GET',
                 headers: {
-                  'x-access-token': apiKey,
+                  'x-access-token': key,
                   'Content-Type': 'application/json'
                 }
               }, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                  try {
-                    resolve(JSON.parse(data));
-                  } catch (e) {
-                    reject(e);
-                  }
+                  try { resolve(JSON.parse(data)); }
+                  catch (e) { reject(e); }
                 });
               });
               req.on('error', reject);
@@ -58,17 +54,36 @@ jobs:
             });
           }
 
+          async function fetchPricesWithBothKeys() {
+            let gold, silver;
+
+            // Try PRIMARY KEY first
+            console.log("Trying main GoldAPI key...");
+            try {
+              gold   = await getJson(GOLD_URL,   process.env.KEY1);
+              silver = await getJson(SILVER_URL, process.env.KEY1);
+            } catch { gold = silver = null; }
+
+            // If primary failed / invalid data → try BACKUP KEY
+            const valid = d => d && typeof d.price === "number";
+
+            if (!valid(gold) || !valid(silver)) {
+              console.log("Main key failed. Trying backup GoldAPI key...");
+              gold   = await getJson(GOLD_URL,   process.env.KEY2);
+              silver = await getJson(SILVER_URL, process.env.KEY2);
+            }
+
+            if (!valid(gold) || !valid(silver)) {
+              console.error("Both API keys failed. Aborting.");
+              process.exit(1);
+            }
+
+            return { gold, silver };
+          }
+
           (async () => {
             try {
-              const [gold, silver] = await Promise.all([
-                getJson(goldUrl),
-                getJson(silverUrl)
-              ]);
-
-              if (typeof gold.price !== 'number' || typeof silver.price !== 'number') {
-                console.error("Invalid GoldAPI response", gold, silver);
-                process.exit(1);
-              }
+              const { gold, silver } = await fetchPricesWithBothKeys();
 
               const payload = {
                 gold_per_oz: gold.price,
@@ -79,7 +94,7 @@ jobs:
               fs.writeFileSync('metal.json', JSON.stringify(payload, null, 2));
               console.log("Updated metal.json:", payload);
             } catch (err) {
-              console.error("Error updating metal.json:", err);
+              console.error("Error:", err);
               process.exit(1);
             }
           })();
